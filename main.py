@@ -8,16 +8,32 @@ from sqlalchemy import text
 
 app = FastAPI()
 
+# --------- DATABASE ---------
 DATABASE_URL = os.getenv("DATABASE_URL")
-
 engine = sqlalchemy.create_engine(DATABASE_URL, pool_pre_ping=True)
 
 
-# --------- MODELO SENCILLO ---------
-# Tabla: measurements(id, ts, value)
-# Luego creas la tabla a mano con SQL (más abajo te digo cómo)
+# --------- CREAR TABLAS AUTOMÁTICAMENTE ---------
+def create_tables():
+    sql = """
+    CREATE TABLE IF NOT EXISTS measurements (
+        id SERIAL PRIMARY KEY,
+        ts TIMESTAMPTZ NOT NULL,
+        value DOUBLE PRECISION NOT NULL
+    );
+    """
+    with engine.begin() as conn:
+        conn.execute(text(sql))
 
 
+@app.on_event("startup")
+def on_startup():
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL no configurada")
+    create_tables()   # <<< CREA LA TABLA AUTOMÁTICAMENTE AL ARRANCAR
+
+
+# --------- MODELOS ---------
 class FilterParams(BaseModel):
     since: datetime | None = None
     until: datetime | None = None
@@ -29,20 +45,11 @@ def root():
     return {"status": "ok"}
 
 
-# --------- POST: subir archivo completo (luego lo adaptamos a "pedazos") ---------
+# --------- POST: subir archivo ---------
 @app.post("/upload")
 async def upload_file(file: UploadFile = File(...)):
-    if not DATABASE_URL:
-        raise HTTPException(status_code=500, detail="DATABASE_URL no configurada")
-
     content = await file.read()
-    # Aquí tú harías:
-    # 1) Reconstruir chunk(s)
-    # 2) Parsear el contenido
-    # 3) Insertar a la DB
 
-    # EJEMPLO: supongamos que el archivo tiene líneas "timestamp_iso;valor"
-    # y las insertamos en la tabla measurements
     try:
         with engine.begin() as conn:
             for line in content.decode("utf-8").splitlines():
@@ -58,15 +65,12 @@ async def upload_file(file: UploadFile = File(...)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error insertando en DB: {e}")
 
-    return {"status": "file_processed", "lines": len(content.splitlines())}
+    return {"status": "file_processed"}
 
 
-# --------- GET: obtener datos con filtros básicos ---------
+# --------- POST: obtener datos ---------
 @app.post("/data")
 def get_data(filters: FilterParams):
-    if not DATABASE_URL:
-        raise HTTPException(status_code=500, detail="DATABASE_URL no configurada")
-
     query = "SELECT id, ts, value FROM measurements WHERE 1=1"
     params = {}
 
