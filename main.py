@@ -30,19 +30,22 @@ app.add_middleware(
 # 1. CONFIGURACIÓN DE BASE DE DATOS
 # =================================================================
 
+# Obtener URL de Render y corregir el prefijo si es necesario
 DATABASE_URL = os.getenv("DATABASE_URL")
 if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
+# Si no hay variable (local), usa SQLite temporal
 if not DATABASE_URL:
     DATABASE_URL = "sqlite:///./local_test.db"
-    print("⚠️ USANDO BASE DE DATOS LOCAL (SQLite)")
+    print("⚠️ USANDO BASE DE DATOS LOCAL (SQLite) - Configura DATABASE_URL para producción")
 
 engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
-# --- MODELOS DB ---
+# --- DEFINICIÓN DE TABLAS (MODELOS) ---
+
 class BridgeDB(Base):
     __tablename__ = "bridges"
     id = Column(String, primary_key=True, index=True)
@@ -50,22 +53,28 @@ class BridgeDB(Base):
     region = Column(String)
     lat = Column(Float)
     lng = Column(Float)
+    # Guardamos la imagen en Base64 directamente (simple para prototipo)
     image_data = Column(Text, nullable=True) 
+    
+    # Relación con sensores
     sensors = relationship("SensorDB", back_populates="bridge", cascade="all, delete-orphan")
 
 class SensorDB(Base):
     __tablename__ = "sensors"
-    id = Column(String, primary_key=True, index=True)
+    id = Column(String, primary_key=True, index=True) # node-a1
     bridge_id = Column(String, ForeignKey("bridges.id"))
     alias = Column(String)
     pos_x = Column(Float)
     pos_y = Column(Float)
     odr = Column(Integer, default=125)
     range_g = Column(Integer, default=2)
+    
     bridge = relationship("BridgeDB", back_populates="sensors")
 
+# Crear tablas si no existen
 Base.metadata.create_all(bind=engine)
 
+# Dependencia para obtener sesión DB
 def get_db():
     db = SessionLocal()
     try:
@@ -74,34 +83,107 @@ def get_db():
         db.close()
 
 # =================================================================
-# 2. MODELOS PYDANTIC
+# 2. MODELOS PYDANTIC (Para recibir datos del Frontend)
 # =================================================================
 
 class BridgeInfo(BaseModel):
     name: str
-    location: dict 
+    location: dict # { lat: float, lng: float, region: str }
 
 class SensorConfig(BaseModel):
     odr: int
     range: int
     filter: Optional[str] = "high-pass"
 
+# Modelo para crear/editar PUENTE
+class BridgeCreatePayload(BaseModel):
+    name: str
+    location: dict # { lat, lng, region }
+    image_data: Optional[str] = None
+    id: Optional[str] = None # Opcional para edición
+
+# Modelo para crear/editar SENSOR
 class SensorCreatePayload(BaseModel):
     id: str
     alias: str
-    bridge_info: BridgeInfo
+    bridge_info: BridgeInfo # Información del puente (para validación)
     x: float
     y: float
     config: SensorConfig
-    image_data: Optional[str] = None 
+    image_data: Optional[str] = None # Base64 de la imagen
 
 # =================================================================
-# 3. ENDPOINTS ADMIN (REALES)
+# 3. ENDPOINTS DE ADMINISTRACIÓN (CRUD REAL)
 # =================================================================
+
+# --- PUENTES ---
+
+@app.post("/admin/bridge")
+def create_or_update_bridge(payload: BridgeCreatePayload, db: Session = Depends(get_db)):
+    """
+    Crea o actualiza un puente (sin sensores).
+    """
+    # Si viene ID, intentamos buscarlo, si no, generamos uno nuevo
+    bridge_id = payload.id
+    if not bridge_id:
+        clean_name = "".join(e for e in payload.name if e.isalnum()).lower()
+        bridge_id = f"br-{clean_name[:8]}"
+    
+    bridge = db.query(BridgeDB).filter(BridgeDB.id == bridge_id).first()
+    
+    if not bridge:
+        # CREAR
+        bridge = BridgeDB(
+            id=bridge_id,
+            name=payload.name,
+            region=payload.location['region'],
+            lat=payload.location['lat'],
+            lng=payload.location['lng'],
+            image_data=payload.image_data
+        )
+        db.add(bridge)
+    else:
+        # ACTUALIZAR
+        bridge.name = payload.name
+        bridge.region = payload.location['region']
+        bridge.lat = payload.location['lat']
+        bridge.lng = payload.location['lng']
+        if payload.image_data: # Solo actualizamos foto si viene nueva
+            bridge.image_data = payload.image_data
+            
+    db.commit()
+    db.refresh(bridge)
+    return {"status": "success", "bridge_id": bridge.id}
+
+@app.delete("/admin/bridge/{bridge_id}")
+def delete_bridge(bridge_id: str, db: Session = Depends(get_db)):
+    """
+    Elimina un puente y todos sus sensores (Cascada).
+    """
+    bridge = db.query(BridgeDB).filter(BridgeDB.id == bridge_id).first()
+    if not bridge:
+        raise HTTPException(status_code=404, detail="Puente no encontrado")
+    
+    db.delete(bridge)
+    db.commit()
+    return {"status": "deleted", "id": bridge_id}
+
+
+# --- SENSORES ---
 
 @app.post("/admin/sensor")
 def create_or_update_sensor(payload: SensorCreatePayload, db: Session = Depends(get_db)):
+    """
+    Crea o actualiza un sensor. 
+    Si el puente no existe, lo crea automáticamente.
+    """
+    
+    # 1. GESTIÓN DEL PUENTE (Upsert implícito)
+    # Buscamos el puente por nombre para ver si ya existe
+    # (Esto es útil si creas el sensor primero que el puente)
+    # Nota: Idealmente deberíamos pasar el bridge_id explícito desde el front
     bridge_id = f"br-{payload.bridge_info.name.replace(' ', '').lower()[:5]}"
+    
     bridge = db.query(BridgeDB).filter(BridgeDB.id == bridge_id).first()
     
     if not bridge:
@@ -114,18 +196,17 @@ def create_or_update_sensor(payload: SensorCreatePayload, db: Session = Depends(
             image_data=payload.image_data
         )
         db.add(bridge)
-    else:
-        if payload.image_data:
-            bridge.image_data = payload.image_data
-            
-    db.commit()
+        db.commit() # Commit intermedio para tener el ID listo
 
+    # 2. GESTIÓN DEL SENSOR (Upsert)
     sensor = db.query(SensorDB).filter(SensorDB.id == payload.id).first()
+    
     if not sensor:
         sensor = SensorDB(id=payload.id)
         db.add(sensor)
     
-    sensor.bridge_id = bridge_id
+    # Actualizar datos
+    sensor.bridge_id = bridge_id # Vinculamos al puente encontrado/creado
     sensor.alias = payload.alias
     sensor.pos_x = payload.x
     sensor.pos_y = payload.y
@@ -137,6 +218,9 @@ def create_or_update_sensor(payload: SensorCreatePayload, db: Session = Depends(
 
 @app.delete("/admin/sensor/{sensor_id}")
 def delete_sensor(sensor_id: str, db: Session = Depends(get_db)):
+    """
+    Elimina un sensor específico.
+    """
     sensor = db.query(SensorDB).filter(SensorDB.id == sensor_id).first()
     if not sensor:
         raise HTTPException(status_code=404, detail="Sensor no encontrado")
@@ -146,36 +230,53 @@ def delete_sensor(sensor_id: str, db: Session = Depends(get_db)):
     return {"status": "deleted"}
 
 # =================================================================
-# 4. ENDPOINT RAÍZ (HÍBRIDO: CONFIG REAL + DATA FAKE)
+# 4. ENDPOINT RAÍZ (EL HÍBRIDO: REAL CONFIG + FAKE DATA)
 # =================================================================
 @app.get("/")
 def get_dashboard_data(db: Session = Depends(get_db)):
+    """
+    Lee Puentes y Sensores REALES de la BD.
+    Inyecta Telemetría y KPIs FALSOS para que el dashboard funcione.
+    """
     bridges_db = db.query(BridgeDB).all()
+    
     dashboard_data = []
     now_iso = datetime.now().isoformat()
 
     for b in bridges_db:
+        # 1. Construir estructura base REAL
         bridge_obj = {
             "id": b.id,
             "nombre": b.name,
             "ubicacion": { "region": b.region, "lat": b.lat, "lng": b.lng },
+            "status": "ok", # Fake status global
             "lastUpdate": now_iso,
-            "meta": { "tipo": "Hormigón Armado", "largo": "N/A", "imagen": b.image_data if b.image_data else "/puente.png" },
-            "kpis": {},
-            "nodes": []
+            # Si hay imagen en BD la usamos, si no, placeholder
+            "meta": { 
+                "tipo": "Hormigón Armado", 
+                "largo": "N/A", 
+                "imagen": b.image_data if b.image_data else "/puente.png" 
+            },
+            "kpis": {}, # Se llenará abajo
+            "nodes": [] # Se llenará abajo
         }
 
+        # 2. Simular Estado Global del Puente
+        # (Para ver variedad, si el nombre tiene 'Bio' lo ponemos en alerta)
         is_alert = "Bio" in b.name
         bridge_obj["status"] = "alert" if is_alert else "ok"
 
+        # 3. Generar KPIs Falsos
         bridge_obj["kpis"] = {
             "structuralHealth": { "id": f"{b.id}-kpi-h", "score": 65 if is_alert else 98, "trend": "stable", "label": "Integridad Estructural", "unit": "%" },
             "accelZ": { "id": f"{b.id}-kpi-z", "val": 0.120 if is_alert else 0.045, "unit": "g", "status": bridge_obj["status"], "label": "Vibración Global (Z)", "trend": "stable" },
             "aiAnalysis": { "id": f"{b.id}-kpi-ai", "type": "text", "status": bridge_obj["status"], "label": "Diagnóstico IA", "text": "Análisis preliminar completado.", "confidence": 95, "lastModelUpdate": now_iso }
         }
 
+        # 4. Procesar Sensores Reales
         for s in b.sensors:
             node_status = "alert" if is_alert and random.random() > 0.5 else "ok"
+            
             node_obj = {
                 "id": s.id,
                 "alias": s.alias,
@@ -183,6 +284,7 @@ def get_dashboard_data(db: Session = Depends(get_db)):
                 "y": s.pos_y,
                 "status": node_status,
                 "config": { "odr": s.odr, "range": s.range_g },
+                # Datos Falsos Vivos
                 "health": { "battery": random.randint(80, 100), "signalStrength": random.randint(-80, -50), "boardTemp": 25.0, "lastSeen": now_iso },
                 "telemetry": { 
                     "accel_rms": { 
@@ -201,12 +303,14 @@ def get_dashboard_data(db: Session = Depends(get_db)):
 
         dashboard_data.append(bridge_obj)
 
+    # Si la BD está vacía, devolvemos al menos un mock para no romper el front
     if not dashboard_data:
         return get_mock_fallback()
 
     return dashboard_data
 
 def get_mock_fallback():
+    # Retorna tu JSON mock original si no hay nada en la BD
     return [{
         "id": "mock-01",
         "nombre": "Puente Demo (Base de Datos Vacía)",
@@ -219,7 +323,7 @@ def get_mock_fallback():
     }]
 
 # =================================================================
-# 5. ENDPOINTS DE DATOS SIMULADOS (SUMMARY / CSV) - CORREGIDOS
+# 5. ENDPOINTS DE DATOS SIMULADOS (SUMMARY / CSV)
 # =================================================================
 
 @app.get("/summary/{resource_id}")
