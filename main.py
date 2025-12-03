@@ -1,4 +1,6 @@
 import os
+import random
+import math
 import io
 from datetime import datetime, timedelta
 from typing import List, Optional
@@ -24,31 +26,21 @@ app.add_middleware(
 )
 
 # =================================================================
-# 1. CONFIGURACIÓN DE BASE DE DATOS (SOLO POSTGRES)
+# 1. CONFIGURACIÓN DE BASE DE DATOS
 # =================================================================
 
 DATABASE_URL = os.getenv("DATABASE_URL")
-
-# Validación estricta: Si no hay URL, no arranca.
-if not DATABASE_URL:
-    raise RuntimeError("CRITICAL: DATABASE_URL no configurada. Este servicio requiere PostgreSQL.")
-
-# Corrección para compatibilidad de SQLAlchemy con Render/Heroku
-if DATABASE_URL.startswith("postgres://"):
+if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
-# Configuración optimizada para Postgres
-engine = create_engine(
-    DATABASE_URL, 
-    pool_pre_ping=True, # Verifica conexión antes de usarla (vital para la nube)
-    pool_size=10, 
-    max_overflow=20
-)
+if not DATABASE_URL:
+    DATABASE_URL = "sqlite:///./local_test.db"
 
+engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
-# --- MODELOS DB ---
+# --- MODELOS DB (SQL Plano) ---
 class BridgeDB(Base):
     __tablename__ = "bridges"
     id = Column(String, primary_key=True, index=True)
@@ -68,8 +60,16 @@ class SensorDB(Base):
     pos_y = Column(Float)
     odr = Column(Integer, default=125)
     range_g = Column(Integer, default=2)
+    
+    # Campos de estado actualizados por DataFlow
+    health_battery = Column(Float, nullable=True)
+    health_rssi = Column(Float, nullable=True)
+    last_seen = Column(DateTime, nullable=True)
+    status = Column(String, default="ok")
+
     bridge = relationship("BridgeDB", back_populates="sensors")
 
+# Tabla de Mediciones (Solo lectura aquí)
 class MeasurementDB(Base):
     __tablename__ = "measurements"
     ts = Column(DateTime, primary_key=True) 
@@ -78,14 +78,8 @@ class MeasurementDB(Base):
     acc_y = Column(Float)
     acc_z = Column(Float)
     temp = Column(Float)
-    battery = Column(Float, nullable=True)
-    rssi = Column(Float, nullable=True)
 
-# Crear tablas si no existen
-try:
-    Base.metadata.create_all(bind=engine)
-except Exception as e:
-    print(f"Error creando tablas (revisa conexión DB): {e}")
+Base.metadata.create_all(bind=engine)
 
 def get_db():
     db = SessionLocal()
@@ -95,7 +89,7 @@ def get_db():
         db.close()
 
 # =================================================================
-# 2. MODELOS PYDANTIC
+# 2. MODELOS PYDANTIC (Entrada Admin)
 # =================================================================
 
 class BridgeInfo(BaseModel):
@@ -128,7 +122,7 @@ def generate_bridge_id(name: str):
     return f"br-{clean_name[:8]}"
 
 # =================================================================
-# 3. ENDPOINTS DE ADMINISTRACIÓN
+# 3. ENDPOINTS ADMIN (CRUD) - Se mantienen igual
 # =================================================================
 
 @app.post("/admin/bridge")
@@ -214,21 +208,28 @@ def delete_sensor(sensor_id: str, db: Session = Depends(get_db)):
     return {"status": "deleted"}
 
 # =================================================================
-# 4. ENDPOINT RAÍZ (REAL)
+# 4. ENDPOINT RAÍZ (TRANSFORMACIÓN A JSON ESTRUCTURADO)
 # =================================================================
+
 @app.get("/")
 def get_dashboard_data(db: Session = Depends(get_db)):
     bridges_db = db.query(BridgeDB).all()
-    dashboard_data = []
     
+    # Si no hay datos, devolvemos lista vacía (Frontend maneja Empty State)
     if not bridges_db:
         return []
 
+    dashboard_data = []
+    
+    # Iteramos Puentes
     for b in bridges_db:
+        
+        # 1. Estructura Base del Puente
         bridge_obj = {
             "id": b.id,
             "nombre": b.name,
             "ubicacion": { "region": b.region, "lat": b.lat, "lng": b.lng },
+            # Estado global (podría calcularse si algún sensor está en alerta)
             "status": "ok", 
             "lastUpdate": None, 
             "meta": { 
@@ -236,50 +237,76 @@ def get_dashboard_data(db: Session = Depends(get_db)):
                 "largo": "N/A", 
                 "imagen": b.image_data if b.image_data else "/puente.png" 
             },
-            "kpis": {}, 
+            # KPIs Globales (Por ahora simulados o calculados simples)
+            "kpis": {
+                "structuralHealth": { "id": f"{b.id}-kpi-h", "score": 98, "trend": "stable", "label": "Integridad Estructural", "unit": "%" },
+                "accelZ": { "id": f"{b.id}-kpi-z", "val": 0.000, "unit": "g", "status": "ok", "label": "Vibración Global (Z)", "trend": "flat" },
+                "aiAnalysis": { "id": f"{b.id}-kpi-ai", "type": "text", "status": "ok", "label": "Diagnóstico IA", "text": "Esperando datos suficientes...", "confidence": 0, "lastModelUpdate": None }
+            },
             "nodes": []
         }
 
         last_update_global = None
+        bridge_status = "ok" # Se vuelve 'alert' si algún sensor está en alerta
 
+        # 2. Procesar Sensores del Puente
         for s in b.sensors:
+            
+            # Buscamos la ÚLTIMA medición real para mostrar valores en vivo
             last_meas = db.query(MeasurementDB).filter(
                 MeasurementDB.sensor_id == s.id
             ).order_by(desc(MeasurementDB.ts)).first()
 
+            # Estructura del Nodo (Tal como la espera el Frontend)
             node_obj = {
                 "id": s.id,
                 "alias": s.alias,
                 "x": s.pos_x,
                 "y": s.pos_y,
-                "status": "ok", 
+                # Estado actualizado por DataFlow en la tabla 'sensors'
+                "status": s.status if s.status else "ok", 
                 "config": { "odr": s.odr, "range": s.range_g },
-                "health": { "battery": 0, "signalStrength": 0, "boardTemp": 0, "lastSeen": None },
-                "telemetry": { "accel_rms": { "x": 0, "y": 0, "z": 0 }, "sensorTemp": 0 },
+                
+                # Datos de Salud (Leídos de la tabla 'sensors' actualizada por DataFlow)
+                "health": { 
+                    "battery": s.health_battery if s.health_battery is not None else 0, 
+                    "signalStrength": s.health_rssi if s.health_rssi is not None else 0, 
+                    "boardTemp": 0, # No lo tenemos en DB aún
+                    "lastSeen": s.last_seen.isoformat() if s.last_seen else None 
+                },
+                
+                # Datos de Telemetría (Leídos de la tabla 'measurements')
+                "telemetry": { 
+                    "accel_rms": { "x": 0, "y": 0, "z": 0 }, 
+                    "sensorTemp": 0 
+                },
                 "alarms": []
             }
 
+            # Si hay datos recientes, llenamos la telemetría
             if last_meas:
-                node_obj["health"] = {
-                    "battery": last_meas.battery if last_meas.battery else 0,
-                    "signalStrength": last_meas.rssi if last_meas.rssi else 0,
-                    "boardTemp": 25.0, 
-                    "lastSeen": last_meas.ts.isoformat()
+                node_obj["telemetry"]["accel_rms"] = {
+                    "x": last_meas.acc_x,
+                    "y": last_meas.acc_y,
+                    "z": last_meas.acc_z
                 }
-                node_obj["telemetry"] = {
-                    "accel_rms": { 
-                        "x": last_meas.acc_x, 
-                        "y": last_meas.acc_y, 
-                        "z": last_meas.acc_z 
-                    },
-                    "sensorTemp": last_meas.temp
-                }
+                node_obj["telemetry"]["sensorTemp"] = last_meas.temp
                 
+                # Actualizar timestamp global
                 if not last_update_global or last_meas.ts > last_update_global:
                     last_update_global = last_meas.ts
 
+            # Si el sensor está en alerta, actualizamos el puente
+            if node_obj["status"] == "alert":
+                bridge_status = "alert"
+                node_obj["alarms"].append({ "type": "THRESHOLD", "severity": "alert", "msg": "Vibración Crítica" })
+            elif node_obj["status"] == "warn" and bridge_status != "alert":
+                bridge_status = "warn"
+
             bridge_obj["nodes"].append(node_obj)
 
+        # Actualizamos el estado global del puente
+        bridge_obj["status"] = bridge_status
         if last_update_global:
             bridge_obj["lastUpdate"] = last_update_global.isoformat()
         
@@ -293,9 +320,12 @@ def get_dashboard_data(db: Session = Depends(get_db)):
 
 @app.get("/summary/{resource_id}")
 def get_trend_summary(resource_id: str, db: Session = Depends(get_db)):
+    """
+    Devuelve array de {t: 'HH:MM', v: value} para el gráfico.
+    """
     measurements = db.query(MeasurementDB).filter(
         MeasurementDB.sensor_id == resource_id
-    ).order_by(desc(MeasurementDB.ts)).limit(144).all() 
+    ).order_by(desc(MeasurementDB.ts)).limit(144).all()
     
     if not measurements:
         return [] 
