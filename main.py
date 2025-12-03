@@ -24,18 +24,27 @@ app.add_middleware(
 )
 
 # =================================================================
-# 1. CONFIGURACIÓN DE BASE DE DATOS
+# 1. CONFIGURACIÓN DE BASE DE DATOS (SOLO POSTGRES)
 # =================================================================
 
 DATABASE_URL = os.getenv("DATABASE_URL")
-if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
+
+# Validación estricta: Si no hay URL, no arranca.
+if not DATABASE_URL:
+    raise RuntimeError("CRITICAL: DATABASE_URL no configurada. Este servicio requiere PostgreSQL.")
+
+# Corrección para compatibilidad de SQLAlchemy con Render/Heroku
+if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
-if not DATABASE_URL:
-    DATABASE_URL = "sqlite:///./local_test.db"
-    print("⚠️ USANDO BASE DE DATOS LOCAL (SQLite)")
+# Configuración optimizada para Postgres
+engine = create_engine(
+    DATABASE_URL, 
+    pool_pre_ping=True, # Verifica conexión antes de usarla (vital para la nube)
+    pool_size=10, 
+    max_overflow=20
+)
 
-engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
@@ -61,10 +70,8 @@ class SensorDB(Base):
     range_g = Column(Integer, default=2)
     bridge = relationship("BridgeDB", back_populates="sensors")
 
-# Tabla REAL de mediciones (para consultas futuras)
 class MeasurementDB(Base):
     __tablename__ = "measurements"
-    # CAMBIO IMPORTANTE: Usamos 'ts' en lugar de 'time' para evitar conflictos SQL
     ts = Column(DateTime, primary_key=True) 
     sensor_id = Column(String, ForeignKey("sensors.id"), primary_key=True)
     acc_x = Column(Float)
@@ -74,7 +81,11 @@ class MeasurementDB(Base):
     battery = Column(Float, nullable=True)
     rssi = Column(Float, nullable=True)
 
-Base.metadata.create_all(bind=engine)
+# Crear tablas si no existen
+try:
+    Base.metadata.create_all(bind=engine)
+except Exception as e:
+    print(f"Error creando tablas (revisa conexión DB): {e}")
 
 def get_db():
     db = SessionLocal()
@@ -117,7 +128,7 @@ def generate_bridge_id(name: str):
     return f"br-{clean_name[:8]}"
 
 # =================================================================
-# 3. ENDPOINTS DE ADMINISTRACIÓN (CRUD)
+# 3. ENDPOINTS DE ADMINISTRACIÓN
 # =================================================================
 
 @app.post("/admin/bridge")
@@ -203,14 +214,13 @@ def delete_sensor(sensor_id: str, db: Session = Depends(get_db)):
     return {"status": "deleted"}
 
 # =================================================================
-# 4. ENDPOINT RAÍZ (REAL - SIN FAKES)
+# 4. ENDPOINT RAÍZ (REAL)
 # =================================================================
 @app.get("/")
 def get_dashboard_data(db: Session = Depends(get_db)):
     bridges_db = db.query(BridgeDB).all()
     dashboard_data = []
     
-    # Si no hay puentes, devolvemos lista vacía (Frontend debe manejarlo)
     if not bridges_db:
         return []
 
@@ -219,8 +229,8 @@ def get_dashboard_data(db: Session = Depends(get_db)):
             "id": b.id,
             "nombre": b.name,
             "ubicacion": { "region": b.region, "lat": b.lat, "lng": b.lng },
-            "status": "ok", # Default status
-            "lastUpdate": None, # Se actualizará si hay datos
+            "status": "ok", 
+            "lastUpdate": None, 
             "meta": { 
                 "tipo": "Estructura Monitorizada", 
                 "largo": "N/A", 
@@ -233,17 +243,16 @@ def get_dashboard_data(db: Session = Depends(get_db)):
         last_update_global = None
 
         for s in b.sensors:
-            # Consultar último dato REAL de este sensor
             last_meas = db.query(MeasurementDB).filter(
                 MeasurementDB.sensor_id == s.id
-            ).order_by(desc(MeasurementDB.ts)).first() # Usamos 'ts'
+            ).order_by(desc(MeasurementDB.ts)).first()
 
             node_obj = {
                 "id": s.id,
                 "alias": s.alias,
                 "x": s.pos_x,
                 "y": s.pos_y,
-                "status": "ok", # Default sin datos
+                "status": "ok", 
                 "config": { "odr": s.odr, "range": s.range_g },
                 "health": { "battery": 0, "signalStrength": 0, "boardTemp": 0, "lastSeen": None },
                 "telemetry": { "accel_rms": { "x": 0, "y": 0, "z": 0 }, "sensorTemp": 0 },
@@ -251,7 +260,6 @@ def get_dashboard_data(db: Session = Depends(get_db)):
             }
 
             if last_meas:
-                # Si hay datos reales, los usamos
                 node_obj["health"] = {
                     "battery": last_meas.battery if last_meas.battery else 0,
                     "signalStrength": last_meas.rssi if last_meas.rssi else 0,
@@ -280,17 +288,14 @@ def get_dashboard_data(db: Session = Depends(get_db)):
     return dashboard_data
 
 # =================================================================
-# 5. ENDPOINTS DE DATOS (SIN SIMULACIÓN MATEMÁTICA)
+# 5. ENDPOINTS DE DATOS (REALES)
 # =================================================================
 
 @app.get("/summary/{resource_id}")
 def get_trend_summary(resource_id: str, db: Session = Depends(get_db)):
-    """
-    Devuelve datos REALES agrupados por hora (o vacíos si no hay).
-    """
     measurements = db.query(MeasurementDB).filter(
         MeasurementDB.sensor_id == resource_id
-    ).order_by(desc(MeasurementDB.ts)).limit(144).all() # Usamos 'ts'
+    ).order_by(desc(MeasurementDB.ts)).limit(144).all() 
     
     if not measurements:
         return [] 
@@ -306,9 +311,6 @@ def get_trend_summary(resource_id: str, db: Session = Depends(get_db)):
 
 @app.get("/export/csv")
 def export_csv(id: str, start: str, end: str, type: str = Query("sensor"), db: Session = Depends(get_db)):
-    """
-    Exporta datos REALES de la base de datos.
-    """
     try:
         start_dt = datetime.fromisoformat(start.replace("T", " "))
         end_dt = datetime.fromisoformat(end.replace("T", " "))
@@ -316,14 +318,12 @@ def export_csv(id: str, start: str, end: str, type: str = Query("sensor"), db: S
         start_dt = datetime.now() - timedelta(hours=1)
         end_dt = datetime.now()
 
-    # Consulta Real
     query = db.query(MeasurementDB).filter(
         MeasurementDB.sensor_id == id,
         MeasurementDB.ts >= start_dt,
         MeasurementDB.ts <= end_dt
-    ).order_by(MeasurementDB.ts) # Usamos 'ts'
+    ).order_by(MeasurementDB.ts) 
     
-    # Stream desde BD
     def iter_csv():
         yield "Timestamp,Accel_X(g),Accel_Y(g),Accel_Z(g),Battery(%),RSSI(dBm)\n"
         for row in query.yield_per(1000): 
