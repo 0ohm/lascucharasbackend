@@ -410,26 +410,51 @@ def get_trend_summary(resource_id: str, db: Session = Depends(get_db)):
 
 @app.get("/export/csv")
 def export_csv(id: str, start: str, end: str, type: str = Query("sensor"), db: Session = Depends(get_db)):
-    try:
-        start_dt = datetime.fromisoformat(start.replace("T", " "))
-        end_dt = datetime.fromisoformat(end.replace("T", " "))
-    except:
-        start_dt = datetime.now() - timedelta(hours=1)
-        end_dt = datetime.now()
+    
+    # 1. DIAGNÓSTICO: Ver qué llega exactamente
+    print(f"📥 CSV REQUEST -> ID: {id} | Start: {start} | End: {end}")
 
+    # 2. PARSEO ROBUSTO (Sin fallback silencioso a now())
+    try:
+        # Intentamos formato ISO estándar (YYYY-MM-DDTHH:MM:SS)
+        # Si viene con espacio en vez de T, lo arreglamos
+        clean_start = start.replace(" ", "T")
+        clean_end = end.replace(" ", "T")
+        
+        # Si falta la hora o segundos, fromisoformat suele ser inteligente, 
+        # pero a veces datetime-local manda "YYYY-MM-DDTHH:MM" (sin segundos)
+        # y python lo acepta bien.
+        start_dt = datetime.fromisoformat(clean_start)
+        end_dt = datetime.fromisoformat(clean_end)
+
+    except ValueError as e:
+        print(f"❌ Error parseando fechas: {e}")
+        return JSONResponse(status_code=400, content={"error": f"Formato de fecha inválido: {str(e)}. Use ISO 8601."})
+
+    print(f"🔍 QUERY DB -> Buscando desde {start_dt} hasta {end_dt}")
+
+    # 3. CONSULTA SQL
     query = db.query(MeasurementDB).filter(
         MeasurementDB.sensor_id == id,
         MeasurementDB.ts >= start_dt,
         MeasurementDB.ts <= end_dt
-    ).order_by(MeasurementDB.ts) 
+    ).order_by(MeasurementDB.ts)
     
+    # 4. GENERADOR CON LOGS
     def iter_csv():
+        # Escribir cabecera
         yield "Timestamp,Accel_X(g),Accel_Y(g),Accel_Z(g),Battery(%),RSSI(dBm)\n"
+        
+        count = 0
+        # yield_per trae datos en lotes para no saturar RAM
         for row in query.yield_per(1000): 
+            count += 1
             ts = row.ts.isoformat()
             bat = row.battery if row.battery is not None else ""
             rssi = row.rssi if row.rssi is not None else ""
             yield f"{ts},{row.acc_x},{row.acc_y},{row.acc_z},{bat},{rssi}\n"
+        
+        print(f"✅ CSV Generado: {count} filas exportadas.")
 
     filename = f"export_{id}.csv"
     return StreamingResponse(
