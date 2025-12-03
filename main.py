@@ -384,29 +384,66 @@ def get_dashboard_data(db: Session = Depends(get_db)):
 # =================================================================
 # 6. ENDPOINTS DE DATOS (REALES)
 # =================================================================
-
 @app.get("/summary/{resource_id}")
 def get_trend_summary(resource_id: str, db: Session = Depends(get_db)):
     """
-    Devuelve array de {t: 'HH:MM', v: value} para el gráfico.
+    Devuelve la tendencia histórica (gráfico) para un Sensor O para un KPI.
     """
-    # Intentamos buscar como sensor
+    
+    # ---------------------------------------------------------
+    # ESCENARIO A: Es un SENSOR (Busca en Measurements)
+    # ---------------------------------------------------------
     measurements = db.query(MeasurementDB).filter(
         MeasurementDB.sensor_id == resource_id
     ).order_by(desc(MeasurementDB.ts)).limit(144).all()
     
-    if not measurements:
-        # Si no hay mediciones, devolvemos vacío (o podrías devolver KPI history si fuera un KPI ID)
-        return [] 
+    if measurements:
+        data = []
+        for m in reversed(measurements): 
+            data.append({
+                "t": m.ts.strftime("%H:%M"),
+                "v": m.acc_z # Graficamos Z por defecto
+            })
+        return data
 
-    data = []
-    for m in reversed(measurements): 
-        data.append({
-            "t": m.ts.strftime("%H:%M"),
-            "v": m.acc_z # Por defecto mostramos Z
-        })
-        
-    return data
+    # ---------------------------------------------------------
+    # ESCENARIO B: Es un KPI (Busca en KpiDB)
+    # ---------------------------------------------------------
+    # El ID viene como "br-puentela-structuralHealth". Hay que separarlo.
+    # Definimos los tipos conocidos para detectar cuál es.
+    known_kpi_types = ["structuralHealth", "accelZ", "accelX", "accelY", "aiAnalysis", "naturalFreq"]
+    
+    target_bridge_id = None
+    target_type = None
+
+    for k_type in known_kpi_types:
+        suffix = f"-{k_type}"
+        if resource_id.endswith(suffix):
+            target_type = k_type
+            # Obtenemos el ID del puente quitándole el sufijo al resource_id
+            target_bridge_id = resource_id[:-len(suffix)]
+            break
+    
+    if target_bridge_id and target_type:
+        # Consultamos la tabla de KPIs
+        kpis = db.query(KpiDB).filter(
+            KpiDB.bridge_id == target_bridge_id,
+            KpiDB.kpi_type == target_type
+        ).order_by(desc(KpiDB.timestamp)).limit(144).all()
+
+        data = []
+        for k in reversed(kpis):
+            # Si es IA, graficamos la "confianza", si es otro, el "valor"
+            val = k.confidence if target_type == "aiAnalysis" else k.value
+            
+            data.append({
+                "t": k.timestamp.strftime("%H:%M"),
+                "v": val if val is not None else 0
+            })
+        return data
+
+    # Si no es ni sensor ni KPI, devolvemos vacío
+    return []
 
 @app.get("/export/csv")
 def export_csv(id: str, start: str, end: str, type: str = Query("sensor"), db: Session = Depends(get_db)):
