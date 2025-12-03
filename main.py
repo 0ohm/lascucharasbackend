@@ -278,14 +278,15 @@ def get_dashboard_data(db: Session = Depends(get_db)):
                 # KPIs por defecto si no existen en BD
                 "structuralHealth": { "id": f"{b.id}-kpi-h", "score": 100, "trend": "stable", "label": "Integridad Estructural", "unit": "%", "status": "ok" },
                 "accelZ": { "id": f"{b.id}-kpi-z", "val": 0.000, "unit": "g", "status": "ok", "label": "Vibración Global (Z)", "trend": "flat" },
-                "aiAnalysis": { "id": f"{b.id}-kpi-ai", "type": "text", "status": "ok", "label": "Diagnóstico IA", "text": "Sin datos suficientes para análisis.", "confidence": 0, "lastModelUpdate": None }
+                "accelGlob": { "id": f"{b.id}-kpi-g", "val": 0.000, "unit": "g", "status": "ok", "label": "Vibración Global", "trend": "flat" }, # <--- Mantenemos esto
+                "aiAnalysis": { "id": f"{b.id}-kpi-ai", "type": "text", "status": "ok", "label": "Diagnóstico IA", "text": "Esperando datos suficientes...", "confidence": 0, "lastModelUpdate": None }
             },
             "nodes": []
         }
 
         # 2. Recuperar KPIs Reales de la BD (si existen)
         # (Aquí buscamos los últimos KPIs generados por la IA)
-        for kpi_type in ["structuralHealth", "accelZ", "aiAnalysis"]:
+        for kpi_type in ["structuralHealth", "accelGlob", "aiAnalysis"]:
             latest_kpi = db.query(KpiDB).filter(
                 KpiDB.bridge_id == b.id, 
                 KpiDB.kpi_type == kpi_type
@@ -402,7 +403,11 @@ def get_trend_summary(resource_id: str, db: Session = Depends(get_db)):
         for m in reversed(measurements): 
             data.append({
                 "t": m.ts.strftime("%H:%M"),
-                "v": m.acc_z # Graficamos Z por defecto
+                "v": {
+                    "x": m.acc_x,
+                    "y": m.acc_y,
+                    "z": m.acc_z 
+                }
             })
         return data
 
@@ -411,7 +416,7 @@ def get_trend_summary(resource_id: str, db: Session = Depends(get_db)):
     # ---------------------------------------------------------
     # El ID viene como "br-puentela-structuralHealth". Hay que separarlo.
     # Definimos los tipos conocidos para detectar cuál es.
-    known_kpi_types = ["structuralHealth", "accelZ", "accelX", "accelY", "aiAnalysis", "naturalFreq"]
+    known_kpi_types = ["structuralHealth", "accelGlob", "accelZ", "accelX", "accelY", "aiAnalysis", "naturalFreq"]
     
     target_bridge_id = None
     target_type = None
