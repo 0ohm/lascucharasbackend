@@ -1,6 +1,4 @@
 import os
-import random
-import math
 import io
 from datetime import datetime, timedelta
 from typing import List, Optional
@@ -11,7 +9,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 # --- SQLALCHEMY IMPORTS ---
-from sqlalchemy import create_engine, Column, String, Integer, Float, ForeignKey, Text
+from sqlalchemy import create_engine, Column, String, Integer, Float, ForeignKey, Text, DateTime, func, desc
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session, relationship
 
@@ -62,6 +60,19 @@ class SensorDB(Base):
     odr = Column(Integer, default=125)
     range_g = Column(Integer, default=2)
     bridge = relationship("BridgeDB", back_populates="sensors")
+
+# Tabla REAL de mediciones (para consultas futuras)
+class MeasurementDB(Base):
+    __tablename__ = "measurements"
+    # Clave primaria compuesta o ID simple para sqlite
+    time = Column(DateTime, primary_key=True) 
+    sensor_id = Column(String, ForeignKey("sensors.id"), primary_key=True)
+    acc_x = Column(Float)
+    acc_y = Column(Float)
+    acc_z = Column(Float)
+    temp = Column(Float)
+    battery = Column(Float, nullable=True)
+    rssi = Column(Float, nullable=True)
 
 Base.metadata.create_all(bind=engine)
 
@@ -192,177 +203,144 @@ def delete_sensor(sensor_id: str, db: Session = Depends(get_db)):
     return {"status": "deleted"}
 
 # =================================================================
-# 4. ENDPOINT RAÍZ (DASHBOARD)
+# 4. ENDPOINT RAÍZ (REAL - SIN FAKES)
 # =================================================================
 @app.get("/")
 def get_dashboard_data(db: Session = Depends(get_db)):
     bridges_db = db.query(BridgeDB).all()
     dashboard_data = []
-    now_iso = datetime.now().isoformat()
+    
+    # Si no hay puentes, devolvemos lista vacía (Frontend debe manejarlo)
+    if not bridges_db:
+        return []
 
     for b in bridges_db:
         bridge_obj = {
             "id": b.id,
             "nombre": b.name,
             "ubicacion": { "region": b.region, "lat": b.lat, "lng": b.lng },
-            "status": "ok",
-            "lastUpdate": now_iso,
-            "meta": { "tipo": "Hormigón", "largo": "N/A", "imagen": b.image_data if b.image_data else "/puente.png" },
-            "kpis": {},
+            "status": "ok", # Default status
+            "lastUpdate": None, # Se actualizará si hay datos
+            "meta": { 
+                "tipo": "Estructura Monitorizada", 
+                "largo": "N/A", 
+                "imagen": b.image_data if b.image_data else "/puente.png" 
+            },
+            "kpis": {}, 
             "nodes": []
         }
 
-        is_alert = "Bio" in b.name
-        bridge_obj["status"] = "alert" if is_alert else "ok"
-
-        bridge_obj["kpis"] = {
-            "structuralHealth": { "id": f"{b.id}-kpi-h", "score": 65 if is_alert else 98, "trend": "stable", "label": "Integridad Estructural", "unit": "%" },
-            "accelZ": { "id": f"{b.id}-kpi-z", "val": 0.120 if is_alert else 0.045, "unit": "g", "status": bridge_obj["status"], "label": "Vibración Global (Z)", "trend": "stable" },
-            "aiAnalysis": { "id": f"{b.id}-kpi-ai", "type": "text", "status": bridge_obj["status"], "label": "Diagnóstico IA", "text": "Análisis preliminar completado.", "confidence": 95, "lastModelUpdate": now_iso }
-        }
+        # Buscamos el último dato de CUALQUIER sensor de este puente para actualizar "lastUpdate"
+        # (Esto es una optimización, en producción real se haría con una tabla de resumen)
+        last_update_global = None
 
         for s in b.sensors:
-            node_status = "alert" if is_alert and random.random() > 0.5 else "ok"
+            # Consultar último dato REAL de este sensor
+            last_meas = db.query(MeasurementDB).filter(
+                MeasurementDB.sensor_id == s.id
+            ).order_by(desc(MeasurementDB.time)).first()
+
             node_obj = {
                 "id": s.id,
                 "alias": s.alias,
                 "x": s.pos_x,
                 "y": s.pos_y,
-                "status": node_status,
+                "status": "ok", # Default sin datos
                 "config": { "odr": s.odr, "range": s.range_g },
-                "health": { "battery": random.randint(80, 100), "signalStrength": random.randint(-80, -50), "boardTemp": 25.0, "lastSeen": now_iso },
-                "telemetry": { 
-                    "accel_rms": { "x": round(random.uniform(0, 0.01), 3), "y": round(random.uniform(0, 0.01), 3), "z": 0.045 }, 
-                    "sensorTemp": 22.0 
-                },
+                "health": { "battery": 0, "signalStrength": 0, "boardTemp": 0, "lastSeen": None },
+                "telemetry": { "accel_rms": { "x": 0, "y": 0, "z": 0 }, "sensorTemp": 0 },
                 "alarms": []
             }
-            if node_status == 'alert':
-                node_obj["alarms"].append({ "type": "THRESHOLD", "severity": "alert", "msg": "Vibración Excesiva" })
+
+            if last_meas:
+                # Si hay datos reales, los usamos
+                node_obj["health"] = {
+                    "battery": last_meas.battery if last_meas.battery else 0,
+                    "signalStrength": last_meas.rssi if last_meas.rssi else 0,
+                    "boardTemp": 25.0, # Placeholder si no guardamos temp de placa
+                    "lastSeen": last_meas.time.isoformat()
+                }
+                node_obj["telemetry"] = {
+                    "accel_rms": { 
+                        "x": last_meas.acc_x, 
+                        "y": last_meas.acc_y, 
+                        "z": last_meas.acc_z 
+                    },
+                    "sensorTemp": last_meas.temp
+                }
+                
+                # Actualizar timestamp global del puente
+                if not last_update_global or last_meas.time > last_update_global:
+                    last_update_global = last_meas.time
+
             bridge_obj["nodes"].append(node_obj)
 
+        if last_update_global:
+            bridge_obj["lastUpdate"] = last_update_global.isoformat()
+        
         dashboard_data.append(bridge_obj)
-
-    if not dashboard_data:
-        return get_mock_fallback()
 
     return dashboard_data
 
-def get_mock_fallback():
-    return [{
-        "id": "mock-01",
-        "nombre": "Puente Demo (Base de Datos Vacía)",
-        "ubicacion": { "region": "Demo", "lat": -33, "lng": -70 },
-        "status": "ok",
-        "lastUpdate": datetime.now().isoformat(),
-        "meta": { "imagen": "/puente.png" },
-        "kpis": { "structuralHealth": { "id": "m-kpi", "score": 100, "label": "Demo", "unit": "%" } },
-        "nodes": []
-    }]
-
 # =================================================================
-# 5. ENDPOINTS SIMULADOS (SUMMARY / CSV) - ¡AHORA SÍ INCLUIDOS!
+# 5. ENDPOINTS DE DATOS (SIN SIMULACIÓN MATEMÁTICA)
 # =================================================================
 
 @app.get("/summary/{resource_id}")
-def get_trend_summary(resource_id: str):
+def get_trend_summary(resource_id: str, db: Session = Depends(get_db)):
+    """
+    Devuelve datos REALES agrupados por hora (o vacíos si no hay).
+    """
+    # Consulta real a BD (Simplificada: Últimos 100 registros)
+    # En producción usarías 'time_bucket' de TimescaleDB
+    
+    measurements = db.query(MeasurementDB).filter(
+        MeasurementDB.sensor_id == resource_id
+    ).order_by(desc(MeasurementDB.time)).limit(144).all() # 144 = 24h * 6 (10min) si tuvieramos resumen
+    
+    if not measurements:
+        return [] # Gráfico vacío
+
+    # Formatear para el frontend
     data = []
-    base_val = 0.045
-    noise = 0.005
-    pattern = 'normal'
-
-    if "node-b1" in resource_id or "b2-" in resource_id:
-        base_val = 0.12
-        pattern = 'damage'
-    elif "node-c1" in resource_id or "b3-" in resource_id:
-        base_val = 0.075
-        pattern = 'wind'
-    elif "ai" in resource_id:
-        base_val = 96
-        noise = 2
-        pattern = 'stable'
-
-    for i in range(24):
-        val = base_val
-        hour = i
-        
-        if pattern == 'normal': # Tráfico
-            if (7 <= hour <= 9) or (18 <= hour <= 20): val += base_val * 0.5
-        elif pattern == 'wind': # Oscilación
-            val += math.sin(i / 3.0) * (noise * 3)
-        elif pattern == 'damage': # Picos
-            if random.random() > 0.8: val += base_val * 0.8
-
-        val += random.uniform(-noise, noise)
-        data.append({ "t": f"{hour:02d}:00", "v": round(val, 4) })
+    for m in reversed(measurements): # Orden cronológico
+        data.append({
+            "t": m.time.strftime("%H:%M"),
+            "v": m.acc_z # Mostramos Z por defecto
+        })
         
     return data
 
 @app.get("/export/csv")
-def export_csv(id: str, start: str, end: str, type: str = Query("sensor")):
+def export_csv(id: str, start: str, end: str, type: str = Query("sensor"), db: Session = Depends(get_db)):
+    """
+    Exporta datos REALES de la base de datos.
+    """
     try:
-        if "T" not in start: start += "T00:00:00"
-        if "T" not in end: end += "T23:59:59"
-        
-        try:
-            start_dt = datetime.fromisoformat(start)
-        except ValueError:
-            start_dt = datetime.strptime(start, "%Y-%m-%dT%H:%M")
-            
-        try:
-            end_dt = datetime.fromisoformat(end)
-        except ValueError:
-            end_dt = datetime.strptime(end, "%Y-%m-%dT%H:%M")
-        
-        if (end_dt - start_dt).total_seconds() > 3600:
-            end_dt = start_dt + timedelta(hours=1)
-            
-    except Exception as e:
-        return {"error": f"Formato de fecha inválido: {e}"}
+        start_dt = datetime.fromisoformat(start.replace("T", " "))
+        end_dt = datetime.fromisoformat(end.replace("T", " "))
+    except:
+        # Fallback simple
+        start_dt = datetime.now() - timedelta(hours=1)
+        end_dt = datetime.now()
 
-    HZ = 200
-    total_seconds = int((end_dt - start_dt).total_seconds())
-    if total_seconds <= 0: total_seconds = 60
-    total_points = total_seconds * HZ
+    # Consulta Real
+    query = db.query(MeasurementDB).filter(
+        MeasurementDB.sensor_id == id,
+        MeasurementDB.time >= start_dt,
+        MeasurementDB.time <= end_dt
+    ).order_by(MeasurementDB.time)
     
+    # Stream desde BD
     def iter_csv():
-        if type == "sensor":
-            yield "Timestamp,Accel_X(g),Accel_Y(g),Accel_Z(g),Battery(%),RSSI(dBm)\n"
-        else:
-            yield "Timestamp,Value,Status,Confidence(%)\n"
+        yield "Timestamp,Accel_X(g),Accel_Y(g),Accel_Z(g),Battery(%),RSSI(dBm)\n"
+        for row in query.yield_per(1000): # Paginación eficiente
+            ts = row.time.isoformat()
+            bat = row.battery if row.battery is not None else ""
+            rssi = row.rssi if row.rssi is not None else ""
+            yield f"{ts},{row.acc_x},{row.acc_y},{row.acc_z},{bat},{rssi}\n"
 
-        current_time = start_dt
-        time_step = timedelta(seconds=1.0/HZ)
-        batt = 98.5
-        rssi = -65.0
-        base_z = 1.0
-        noise = 0.02
-        
-        if "b2" in id or "node-b1" in id: noise = 0.08 
-
-        for i in range(total_points):
-            ts_str = current_time.isoformat()
-            
-            if type == "sensor":
-                x = random.uniform(-noise, noise)
-                y = random.uniform(-noise, noise)
-                z = base_z + random.uniform(-noise, noise)
-                
-                bat_str = ""
-                rssi_str = ""
-                if i % 200 == 0:
-                    bat_str = f"{batt:.1f}"
-                    rssi_str = f"{rssi:.0f}"
-                    if random.random() > 0.99: batt -= 0.1
-                
-                yield f"{ts_str},{x:.4f},{y:.4f},{z:.4f},{bat_str},{rssi_str}\n"
-            else:
-                val = 0.5 + random.uniform(-0.1, 0.1)
-                yield f"{ts_str},{val:.3f},ok,98\n"
-            
-            current_time += time_step
-
-    filename = f"export_{id}_{start_dt.strftime('%Y%m%d%H%M')}.csv"
+    filename = f"export_{id}.csv"
     return StreamingResponse(
         iter_csv(),
         media_type="text/csv",
