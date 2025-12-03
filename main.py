@@ -64,8 +64,8 @@ class SensorDB(Base):
 # Tabla REAL de mediciones (para consultas futuras)
 class MeasurementDB(Base):
     __tablename__ = "measurements"
-    # Clave primaria compuesta o ID simple para sqlite
-    time = Column(DateTime, primary_key=True) 
+    # CAMBIO IMPORTANTE: Usamos 'ts' en lugar de 'time' para evitar conflictos SQL
+    ts = Column(DateTime, primary_key=True) 
     sensor_id = Column(String, ForeignKey("sensors.id"), primary_key=True)
     acc_x = Column(Float)
     acc_y = Column(Float)
@@ -230,15 +230,13 @@ def get_dashboard_data(db: Session = Depends(get_db)):
             "nodes": []
         }
 
-        # Buscamos el último dato de CUALQUIER sensor de este puente para actualizar "lastUpdate"
-        # (Esto es una optimización, en producción real se haría con una tabla de resumen)
         last_update_global = None
 
         for s in b.sensors:
             # Consultar último dato REAL de este sensor
             last_meas = db.query(MeasurementDB).filter(
                 MeasurementDB.sensor_id == s.id
-            ).order_by(desc(MeasurementDB.time)).first()
+            ).order_by(desc(MeasurementDB.ts)).first() # Usamos 'ts'
 
             node_obj = {
                 "id": s.id,
@@ -257,8 +255,8 @@ def get_dashboard_data(db: Session = Depends(get_db)):
                 node_obj["health"] = {
                     "battery": last_meas.battery if last_meas.battery else 0,
                     "signalStrength": last_meas.rssi if last_meas.rssi else 0,
-                    "boardTemp": 25.0, # Placeholder si no guardamos temp de placa
-                    "lastSeen": last_meas.time.isoformat()
+                    "boardTemp": 25.0, 
+                    "lastSeen": last_meas.ts.isoformat()
                 }
                 node_obj["telemetry"] = {
                     "accel_rms": { 
@@ -269,9 +267,8 @@ def get_dashboard_data(db: Session = Depends(get_db)):
                     "sensorTemp": last_meas.temp
                 }
                 
-                # Actualizar timestamp global del puente
-                if not last_update_global or last_meas.time > last_update_global:
-                    last_update_global = last_meas.time
+                if not last_update_global or last_meas.ts > last_update_global:
+                    last_update_global = last_meas.ts
 
             bridge_obj["nodes"].append(node_obj)
 
@@ -291,22 +288,18 @@ def get_trend_summary(resource_id: str, db: Session = Depends(get_db)):
     """
     Devuelve datos REALES agrupados por hora (o vacíos si no hay).
     """
-    # Consulta real a BD (Simplificada: Últimos 100 registros)
-    # En producción usarías 'time_bucket' de TimescaleDB
-    
     measurements = db.query(MeasurementDB).filter(
         MeasurementDB.sensor_id == resource_id
-    ).order_by(desc(MeasurementDB.time)).limit(144).all() # 144 = 24h * 6 (10min) si tuvieramos resumen
+    ).order_by(desc(MeasurementDB.ts)).limit(144).all() # Usamos 'ts'
     
     if not measurements:
-        return [] # Gráfico vacío
+        return [] 
 
-    # Formatear para el frontend
     data = []
-    for m in reversed(measurements): # Orden cronológico
+    for m in reversed(measurements): 
         data.append({
-            "t": m.time.strftime("%H:%M"),
-            "v": m.acc_z # Mostramos Z por defecto
+            "t": m.ts.strftime("%H:%M"),
+            "v": m.acc_z 
         })
         
     return data
@@ -320,22 +313,21 @@ def export_csv(id: str, start: str, end: str, type: str = Query("sensor"), db: S
         start_dt = datetime.fromisoformat(start.replace("T", " "))
         end_dt = datetime.fromisoformat(end.replace("T", " "))
     except:
-        # Fallback simple
         start_dt = datetime.now() - timedelta(hours=1)
         end_dt = datetime.now()
 
     # Consulta Real
     query = db.query(MeasurementDB).filter(
         MeasurementDB.sensor_id == id,
-        MeasurementDB.time >= start_dt,
-        MeasurementDB.time <= end_dt
-    ).order_by(MeasurementDB.time)
+        MeasurementDB.ts >= start_dt,
+        MeasurementDB.ts <= end_dt
+    ).order_by(MeasurementDB.ts) # Usamos 'ts'
     
     # Stream desde BD
     def iter_csv():
         yield "Timestamp,Accel_X(g),Accel_Y(g),Accel_Z(g),Battery(%),RSSI(dBm)\n"
-        for row in query.yield_per(1000): # Paginación eficiente
-            ts = row.time.isoformat()
+        for row in query.yield_per(1000): 
+            ts = row.ts.isoformat()
             bat = row.battery if row.battery is not None else ""
             rssi = row.rssi if row.rssi is not None else ""
             yield f"{ts},{row.acc_x},{row.acc_y},{row.acc_z},{bat},{rssi}\n"
