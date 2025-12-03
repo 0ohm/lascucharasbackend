@@ -34,14 +34,16 @@ if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
 if not DATABASE_URL:
-    # Fallback local solo si no hay variable
     DATABASE_URL = "sqlite:///./local_test.db"
+    print("⚠️ USANDO BASE DE DATOS LOCAL (SQLite)")
 
 engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
-# --- MODELOS DB ---
+# =================================================================
+# 2. MODELOS DE BASE DE DATOS (ESQUEMA COMPLETO)
+# =================================================================
 
 class BridgeDB(Base):
     __tablename__ = "bridges"
@@ -50,36 +52,41 @@ class BridgeDB(Base):
     region = Column(String)
     lat = Column(Float)
     lng = Column(Float)
-    image_data = Column(Text, nullable=True) 
-    # Cascada vital para borrar todo de una vez
+    image_data = Column(Text, nullable=True)
+    
+    # Estado administrativo (ej: 'maintenance', 'active')
+    admin_status = Column(String, default="active") 
+
+    # Relaciones con Cascada
     sensors = relationship("SensorDB", back_populates="bridge", cascade="all, delete-orphan")
+    kpis = relationship("KpiDB", back_populates="bridge", cascade="all, delete-orphan")
 
 class SensorDB(Base):
     __tablename__ = "sensors"
     id = Column(String, primary_key=True, index=True)
-    # Cascada en DB (ON DELETE CASCADE) es mejor gestionada por SQLAlchemy con cascade="..." arriba
-    bridge_id = Column(String, ForeignKey("bridges.id")) 
+    bridge_id = Column(String, ForeignKey("bridges.id", ondelete="CASCADE"))
     alias = Column(String)
     pos_x = Column(Float)
     pos_y = Column(Float)
     odr = Column(Integer, default=125)
     range_g = Column(Integer, default=2)
     
-    # Campos de estado (Actualizados por DataFlow)
+    # Filtro de configuración
+    filter_type = Column(String, default="high-pass") 
+
+    # Campos de salud (Snapshot actualizado por DataFlow)
     health_battery = Column(Float, nullable=True)
     health_rssi = Column(Float, nullable=True)
     last_seen = Column(DateTime, nullable=True)
-    status = Column(String, default="ok")
-
+    status = Column(String, default="ok") 
+    
     bridge = relationship("BridgeDB", back_populates="sensors")
-    # Relación inversa para borrar mediciones si se borra el sensor
-    # (Esto permite borrar sensor desde Python y que SQLAlchemy limpie las mediciones)
     measurements = relationship("MeasurementDB", back_populates="sensor", cascade="all, delete-orphan")
 
 class MeasurementDB(Base):
     __tablename__ = "measurements"
     ts = Column(DateTime, primary_key=True) 
-    sensor_id = Column(String, ForeignKey("sensors.id"), primary_key=True)
+    sensor_id = Column(String, ForeignKey("sensors.id", ondelete="CASCADE"), primary_key=True)
     acc_x = Column(Float)
     acc_y = Column(Float)
     acc_z = Column(Float)
@@ -89,8 +96,29 @@ class MeasurementDB(Base):
     
     sensor = relationship("SensorDB", back_populates="measurements")
 
+class KpiDB(Base):
+    __tablename__ = "kpis"
+    id = Column(Integer, primary_key=True, index=True)
+    timestamp = Column(DateTime, default=func.now())
+    bridge_id = Column(String, ForeignKey("bridges.id", ondelete="CASCADE"))
+    
+    # Tipo de KPI: 'structuralHealth', 'naturalFreq', 'aiAnalysis', 'accelZ', etc.
+    kpi_type = Column(String, nullable=False) 
+    
+    # Valores
+    value = Column(Float, nullable=True)
+    text_value = Column(Text, nullable=True) # Para mensajes IA
+    
+    status = Column(String, default="ok") 
+    confidence = Column(Float, nullable=True) # Para IA
+
+    bridge = relationship("BridgeDB", back_populates="kpis")
+
 # Inicializar tablas
-Base.metadata.create_all(bind=engine)
+try:
+    Base.metadata.create_all(bind=engine)
+except Exception as e:
+    print(f"Nota DB: {e}")
 
 def get_db():
     db = SessionLocal()
@@ -100,7 +128,7 @@ def get_db():
         db.close()
 
 # =================================================================
-# 2. MODELOS PYDANTIC
+# 3. MODELOS PYDANTIC (PAYLOADS)
 # =================================================================
 
 class BridgeInfo(BaseModel):
@@ -133,7 +161,7 @@ def generate_bridge_id(name: str):
     return f"br-{clean_name[:8]}"
 
 # =================================================================
-# 3. ENDPOINTS DE ADMINISTRACIÓN (CRUD)
+# 4. ENDPOINTS DE ADMINISTRACIÓN (CRUD)
 # =================================================================
 
 @app.post("/admin/bridge")
@@ -165,16 +193,15 @@ def create_or_update_bridge(payload: BridgeCreatePayload, db: Session = Depends(
 
 @app.post("/admin/sensor")
 def create_or_update_sensor(payload: SensorCreatePayload, db: Session = Depends(get_db)):
-    # Lógica de ID de puente (Prioridad al ID explícito)
     if payload.bridge_id:
         target_bridge_id = payload.bridge_id
     else:
         target_bridge_id = generate_bridge_id(payload.bridge_info.name)
     
-    # Asegurar que el puente existe
+    # Verificar existencia del puente
     bridge = db.query(BridgeDB).filter(BridgeDB.id == target_bridge_id).first()
-    
     if not bridge:
+        # Crear puente implícitamente si no existe (Opcional)
         bridge = BridgeDB(
             id=target_bridge_id,
             name=payload.bridge_info.name,
@@ -186,7 +213,6 @@ def create_or_update_sensor(payload: SensorCreatePayload, db: Session = Depends(
         db.add(bridge)
         db.commit() 
 
-    # Crear/Actualizar Sensor
     sensor = db.query(SensorDB).filter(SensorDB.id == payload.id).first()
     
     if not sensor:
@@ -209,8 +235,7 @@ def delete_bridge(bridge_id: str, db: Session = Depends(get_db)):
     if not bridge:
         raise HTTPException(status_code=404, detail="Puente no encontrado")
     
-    # SQLAlchemy borrará sensores y mediciones gracias al 'cascade'
-    db.delete(bridge)
+    db.delete(bridge) # SQLAlchemy Cascade borrará sensores, kpis, etc.
     db.commit()
     return {"status": "deleted", "id": bridge_id}
 
@@ -220,23 +245,24 @@ def delete_sensor(sensor_id: str, db: Session = Depends(get_db)):
     if not sensor:
         raise HTTPException(status_code=404, detail="Sensor no encontrado")
     
-    # SQLAlchemy borrará mediciones asociadas gracias al 'cascade' en SensorDB.measurements
-    db.delete(sensor)
+    db.delete(sensor) # SQLAlchemy Cascade borrará mediciones
     db.commit()
     return {"status": "deleted"}
 
 # =================================================================
-# 4. ENDPOINT RAÍZ (DATOS REALES)
+# 5. ENDPOINT RAÍZ (ESTRUCTURA JSON REAL)
 # =================================================================
 @app.get("/")
 def get_dashboard_data(db: Session = Depends(get_db)):
     bridges_db = db.query(BridgeDB).all()
-    dashboard_data = []
     
     if not bridges_db:
         return []
 
+    dashboard_data = []
+
     for b in bridges_db:
+        # 1. Estructura Base del Puente
         bridge_obj = {
             "id": b.id,
             "nombre": b.name,
@@ -248,15 +274,49 @@ def get_dashboard_data(db: Session = Depends(get_db)):
                 "largo": "N/A", 
                 "imagen": b.image_data if b.image_data else "/puente.png" 
             },
-            "kpis": {}, 
+            "kpis": {
+                # KPIs por defecto si no existen en BD
+                "structuralHealth": { "id": f"{b.id}-kpi-h", "score": 100, "trend": "stable", "label": "Integridad Estructural", "unit": "%", "status": "ok" },
+                "accelZ": { "id": f"{b.id}-kpi-z", "val": 0.000, "unit": "g", "status": "ok", "label": "Vibración Global (Z)", "trend": "flat" },
+                "aiAnalysis": { "id": f"{b.id}-kpi-ai", "type": "text", "status": "ok", "label": "Diagnóstico IA", "text": "Sin datos suficientes para análisis.", "confidence": 0, "lastModelUpdate": None }
+            },
             "nodes": []
         }
 
-        last_update_global = None
-        bridge_status = "ok"
+        # 2. Recuperar KPIs Reales de la BD (si existen)
+        # (Aquí buscamos los últimos KPIs generados por la IA)
+        for kpi_type in ["structuralHealth", "accelZ", "aiAnalysis"]:
+            latest_kpi = db.query(KpiDB).filter(
+                KpiDB.bridge_id == b.id, 
+                KpiDB.kpi_type == kpi_type
+            ).order_by(desc(KpiDB.timestamp)).first()
+            
+            if latest_kpi:
+                kpi_data = {
+                    "id": f"{b.id}-{kpi_type}",
+                    "status": latest_kpi.status,
+                    "label": bridge_obj["kpis"][kpi_type]["label"], # Mantenemos label fijo
+                    "lastModelUpdate": latest_kpi.timestamp.isoformat()
+                }
+                
+                if kpi_type == "aiAnalysis":
+                    kpi_data["type"] = "text"
+                    kpi_data["text"] = latest_kpi.text_value
+                    kpi_data["confidence"] = latest_kpi.confidence
+                else:
+                    kpi_data["val"] = latest_kpi.value
+                    kpi_data["unit"] = bridge_obj["kpis"][kpi_type]["unit"]
+                    kpi_data["score"] = latest_kpi.value # Algunos usan score
+                    kpi_data["trend"] = "stable" # Podría calcularse comparando con el anterior
 
+                bridge_obj["kpis"][kpi_type] = kpi_data
+
+        last_update_global = None
+        bridge_status = "ok" # Estado derivado de sensores
+
+        # 3. Procesar Sensores
         for s in b.sensors:
-            # Buscar último dato real (usando 'ts')
+            # Buscar último dato real
             last_meas = db.query(MeasurementDB).filter(
                 MeasurementDB.sensor_id == s.id
             ).order_by(desc(MeasurementDB.ts)).first()
@@ -266,20 +326,27 @@ def get_dashboard_data(db: Session = Depends(get_db)):
                 "alias": s.alias,
                 "x": s.pos_x,
                 "y": s.pos_y,
+                # Estado actual directo desde la BD
                 "status": s.status if s.status else "ok", 
                 "config": { "odr": s.odr, "range": s.range_g },
-                # Datos de Salud (Vienen de la tabla sensors, actualizados por DataFlow)
+                
+                # Salud desde BD (Tabla sensors)
                 "health": { 
                     "battery": s.health_battery if s.health_battery is not None else 0, 
                     "signalStrength": s.health_rssi if s.health_rssi is not None else 0, 
                     "boardTemp": 0, 
                     "lastSeen": s.last_seen.isoformat() if s.last_seen else None 
                 },
-                # Telemetría: Si hay dato, lo mostramos. Si no, ceros.
-                "telemetry": { "accel_rms": { "x": 0, "y": 0, "z": 0 }, "sensorTemp": 0 },
+                
+                # Telemetría (Inicializar vacío)
+                "telemetry": { 
+                    "accel_rms": { "x": 0.0, "y": 0.0, "z": 0.0 }, 
+                    "sensorTemp": 0.0 
+                },
                 "alarms": []
             }
 
+            # Llenar telemetría si hay datos
             if last_meas:
                 node_obj["telemetry"] = {
                     "accel_rms": { 
@@ -293,49 +360,50 @@ def get_dashboard_data(db: Session = Depends(get_db)):
                 if not last_update_global or last_meas.ts > last_update_global:
                     last_update_global = last_meas.ts
 
-            # Lógica básica de estado (puedes mejorarla con la tabla events después)
+            # Derivar estado del puente
             if node_obj["status"] == "alert":
                 bridge_status = "alert"
-                node_obj["alarms"].append({ "type": "THRESHOLD", "severity": "alert", "msg": "Alerta detectada" })
+            elif node_obj["status"] == "warn" and bridge_status != "alert":
+                bridge_status = "warn"
 
             bridge_obj["nodes"].append(node_obj)
 
-        # Actualizar estado global y timestamp del puente
-        bridge_obj["status"] = bridge_status
+        # Actualizar globales
+        if bridge_status != "ok":
+            bridge_obj["status"] = bridge_status
+            # Actualizamos el KPI visual también para que coincida
+            bridge_obj["kpis"]["structuralHealth"]["status"] = bridge_status 
+            
         if last_update_global:
             bridge_obj["lastUpdate"] = last_update_global.isoformat()
-
-        # KPIs Globales (Calculados simples por ahora)
-        bridge_obj["kpis"] = {
-            "structuralHealth": { "id": f"{b.id}-health", "score": 100 if bridge_status == 'ok' else 60, "trend": "stable", "label": "Integridad", "unit": "%" },
-            "accelZ": { "id": f"{b.id}-accel", "val": 0.000, "unit": "g", "status": bridge_status, "label": "Vibración (Z)", "trend": "flat" },
-             "aiAnalysis": { "id": f"{b.id}-ai", "type": "text", "status": bridge_status, "label": "IA", "text": "Monitorizando...", "confidence": 0 }
-        }
         
         dashboard_data.append(bridge_obj)
 
     return dashboard_data
 
 # =================================================================
-# 5. ENDPOINTS DE DATOS (REALES)
+# 6. ENDPOINTS DE DATOS (REALES)
 # =================================================================
 
 @app.get("/summary/{resource_id}")
 def get_trend_summary(resource_id: str, db: Session = Depends(get_db)):
-    # Consulta Real: Últimos 144 puntos ordenados por tiempo
+    """
+    Devuelve array de {t: 'HH:MM', v: value} para el gráfico.
+    """
+    # Intentamos buscar como sensor
     measurements = db.query(MeasurementDB).filter(
         MeasurementDB.sensor_id == resource_id
     ).order_by(desc(MeasurementDB.ts)).limit(144).all()
     
     if not measurements:
+        # Si no hay mediciones, devolvemos vacío (o podrías devolver KPI history si fuera un KPI ID)
         return [] 
 
-    # Convertir a formato gráfico {t, v}
     data = []
-    for m in reversed(measurements): # Revertir para que quede cronológico (Izq a Der)
+    for m in reversed(measurements): 
         data.append({
             "t": m.ts.strftime("%H:%M"),
-            "v": m.acc_z 
+            "v": m.acc_z # Por defecto mostramos Z
         })
         
     return data
@@ -343,7 +411,6 @@ def get_trend_summary(resource_id: str, db: Session = Depends(get_db)):
 @app.get("/export/csv")
 def export_csv(id: str, start: str, end: str, type: str = Query("sensor"), db: Session = Depends(get_db)):
     try:
-        # Parseo robusto de fechas (acepta con o sin T)
         start_dt = datetime.fromisoformat(start.replace("T", " "))
         end_dt = datetime.fromisoformat(end.replace("T", " "))
     except:
@@ -354,11 +421,10 @@ def export_csv(id: str, start: str, end: str, type: str = Query("sensor"), db: S
         MeasurementDB.sensor_id == id,
         MeasurementDB.ts >= start_dt,
         MeasurementDB.ts <= end_dt
-    ).order_by(MeasurementDB.ts)
+    ).order_by(MeasurementDB.ts) 
     
     def iter_csv():
         yield "Timestamp,Accel_X(g),Accel_Y(g),Accel_Z(g),Battery(%),RSSI(dBm)\n"
-        # Yield per 1000 para no saturar memoria
         for row in query.yield_per(1000): 
             ts = row.ts.isoformat()
             bat = row.battery if row.battery is not None else ""
