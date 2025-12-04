@@ -281,7 +281,6 @@ def get_dashboard_data(db: Session = Depends(get_db)):
             "kpis": {
                 # KPIs por defecto si no existen en BD
                 "structuralHealth": { "id": f"{b.id}-kpi-h", "score": 100, "trend": "stable", "label": "Integridad Estructural", "unit": "%", "status": "ok" },
-                "accelZ": { "id": f"{b.id}-kpi-z", "val": 0.000, "unit": "g", "status": "ok", "label": "Vibración Global (Z)", "trend": "flat" },
                 "accelGlob": { "id": f"{b.id}-kpi-g", "val": 0.000, "unit": "g", "status": "ok", "label": "Vibración Global", "trend": "flat" },
                 "aiAnalysis": { "id": f"{b.id}-kpi-ai", "type": "text", "status": "ok", "label": "Diagnóstico IA", "text": "Esperando datos suficientes...", "confidence": 0, "lastModelUpdate": None }
             },
