@@ -102,7 +102,7 @@ class KpiDB(Base):
     timestamp = Column(DateTime, default=func.now())
     bridge_id = Column(String, ForeignKey("bridges.id", ondelete="CASCADE"))
     
-    # Tipo de KPI: 'structuralHealth', 'naturalFreq', 'aiAnalysis', 'accelZ', etc.
+    # Tipo de KPI: 'structuralHealth', 'naturalFreq', 'aiAnalysis', etc.
     kpi_type = Column(String, nullable=False) 
     
     # Valores
@@ -254,6 +254,10 @@ def delete_sensor(sensor_id: str, db: Session = Depends(get_db)):
 # =================================================================
 @app.get("/")
 def get_dashboard_data(db: Session = Depends(get_db)):
+    """
+    Lee Puentes y Sensores REALES de la BD.
+    Inyecta Telemetría y KPIs FALSOS para que el dashboard funcione.
+    """
     bridges_db = db.query(BridgeDB).all()
     
     if not bridges_db:
@@ -277,47 +281,59 @@ def get_dashboard_data(db: Session = Depends(get_db)):
             "kpis": {
                 # KPIs por defecto si no existen en BD
                 "structuralHealth": { "id": f"{b.id}-kpi-h", "score": 100, "trend": "stable", "label": "Integridad Estructural", "unit": "%", "status": "ok" },
-                # "accelZ": { "id": f"{b.id}-kpi-z", "val": 0.000, "unit": "g", "status": "ok", "label": "Vibración Global (Z)", "trend": "flat" },
-                "accelGlob": { "id": f"{b.id}-kpi-g", "val": 0.000, "unit": "g", "status": "ok", "label": "Vibración Global", "trend": "flat" }, # <--- Mantenemos esto
+                "accelZ": { "id": f"{b.id}-kpi-z", "val": 0.000, "unit": "g", "status": "ok", "label": "Vibración Global (Z)", "trend": "flat" },
+                "accelGlob": { "id": f"{b.id}-kpi-g", "val": 0.000, "unit": "g", "status": "ok", "label": "Vibración Global", "trend": "flat" },
                 "aiAnalysis": { "id": f"{b.id}-kpi-ai", "type": "text", "status": "ok", "label": "Diagnóstico IA", "text": "Esperando datos suficientes...", "confidence": 0, "lastModelUpdate": None }
             },
             "nodes": []
         }
 
-        # 2. Recuperar KPIs Reales de la BD (si existen)
-        # (Aquí buscamos los últimos KPIs generados por la IA)
-        for kpi_type in ["structuralHealth", "accelGlob", "aiAnalysis"]:
-            latest_kpi = db.query(KpiDB).filter(
-                KpiDB.bridge_id == b.id, 
-                KpiDB.kpi_type == kpi_type
-            ).order_by(desc(KpiDB.timestamp)).first()
+        # 2. Recuperar KPIs Reales y Telemetría (Pre-agregación)
+        last_update_global = None
+        bridge_status = "ok" # Estado general del puente
+        
+        kpis_db = db.query(KpiDB).filter(KpiDB.bridge_id == b.id).order_by(desc(KpiDB.timestamp)).all()
+        kpis_map = {k.kpi_type: k for k in kpis_db}
+        latest_kpis_map = {}
+        for k_db in kpis_db:
+            if k_db.kpi_type not in latest_kpis_map:
+                latest_kpis_map[k_db.kpi_type] = k_db
+
+        # 3. Integrar KPIS Reales y Establecer Estado Global
+        for k_type, k_default in bridge_obj["kpis"].items():
+            k_db = latest_kpis_map.get(k_type)
             
-            if latest_kpi:
+            if k_db:
+                current_kpi_status = k_db.status if k_db.status else "ok"
+                
                 kpi_data = {
-                    "id": f"{b.id}-{kpi_type}",
-                    "status": latest_kpi.status,
-                    "label": bridge_obj["kpis"][kpi_type]["label"], # Mantenemos label fijo
-                    "lastModelUpdate": latest_kpi.timestamp.isoformat()
+                    "id": f"{b.id}-{k_type}",
+                    "status": current_kpi_status, # USAMOS EL STATUS QUE EL DATAFLOW CALCULÓ (CORRECTO)
+                    "label": k_default["label"], 
+                    "lastModelUpdate": k_db.timestamp.isoformat() if k_db.timestamp else None
                 }
                 
-                if kpi_type == "aiAnalysis":
+                if k_type == "aiAnalysis":
                     kpi_data["type"] = "text"
-                    kpi_data["text"] = latest_kpi.text_value
-                    kpi_data["confidence"] = latest_kpi.confidence
+                    kpi_data["text"] = k_db.text_value
+                    kpi_data["confidence"] = k_db.confidence
                 else:
-                    kpi_data["val"] = latest_kpi.value
-                    kpi_data["unit"] = bridge_obj["kpis"][kpi_type]["unit"]
-                    kpi_data["score"] = latest_kpi.value # Algunos usan score
-                    kpi_data["trend"] = "stable" # Podría calcularse comparando con el anterior
+                    kpi_data["val"] = k_db.value if k_db.value is not None else 0.0
+                    kpi_data["unit"] = k_default["unit"]
+                    kpi_data["score"] = k_db.value if k_db.value is not None else 0.0
+                    kpi_data["trend"] = "stable"
 
-                bridge_obj["kpis"][kpi_type] = kpi_data
+                bridge_obj["kpis"][k_type] = kpi_data
+                
+                # DETERMINAR ESTADO GLOBAL DEL PUENTE (El peor estado encontrado es el global)
+                if current_kpi_status == "alert":
+                    bridge_status = "alert"
+                elif current_kpi_status == "warn" and bridge_status != "alert":
+                    bridge_status = "warn"
 
-        last_update_global = None
-        bridge_status = "ok" # Estado derivado de sensores
 
-        # 3. Procesar Sensores
+        # 4. Procesar Sensores (Solo para Telemetría y Heartbeat)
         for s in b.sensors:
-            # Buscar último dato real
             last_meas = db.query(MeasurementDB).filter(
                 MeasurementDB.sensor_id == s.id
             ).order_by(desc(MeasurementDB.ts)).first()
@@ -327,27 +343,18 @@ def get_dashboard_data(db: Session = Depends(get_db)):
                 "alias": s.alias,
                 "x": s.pos_x,
                 "y": s.pos_y,
-                # Estado actual directo desde la BD
                 "status": s.status if s.status else "ok", 
                 "config": { "odr": s.odr, "range": s.range_g },
-                
-                # Salud desde BD (Tabla sensors)
                 "health": { 
                     "battery": s.health_battery if s.health_battery is not None else 0, 
                     "signalStrength": s.health_rssi if s.health_rssi is not None else 0, 
                     "boardTemp": 0, 
                     "lastSeen": s.last_seen.isoformat() if s.last_seen else None 
                 },
-                
-                # Telemetría (Inicializar vacío)
-                "telemetry": { 
-                    "accel_rms": { "x": 0.0, "y": 0.0, "z": 0.0 }, 
-                    "sensorTemp": 0.0 
-                },
+                "telemetry": { "accel_rms": { "x": 0.0, "y": 0.0, "z": 0.0 }, "sensorTemp": 0.0 },
                 "alarms": []
             }
 
-            # Llenar telemetría si hay datos
             if last_meas:
                 node_obj["telemetry"] = {
                     "accel_rms": { 
@@ -361,20 +368,21 @@ def get_dashboard_data(db: Session = Depends(get_db)):
                 if not last_update_global or last_meas.ts > last_update_global:
                     last_update_global = last_meas.ts
 
-            # Derivar estado del puente
+            # Derivar estado del puente (solo si el sensor es más grave que el estado actual)
             if node_obj["status"] == "alert":
                 bridge_status = "alert"
+                node_obj["alarms"].append({ "type": "HEALTH", "severity": "alert", "msg": "Fallo de comunicación/batería" })
             elif node_obj["status"] == "warn" and bridge_status != "alert":
                 bridge_status = "warn"
 
             bridge_obj["nodes"].append(node_obj)
 
-        # Actualizar globales
+        # 5. AJUSTE FINAL DE ESTADO GLOBAL
         if bridge_status != "ok":
-            bridge_obj["status"] = bridge_status
-            # Actualizamos el KPI visual también para que coincida
-            bridge_obj["kpis"]["structuralHealth"]["status"] = bridge_status 
+            bridge_obj["status"] = bridge_status # <--- Esto es el semáforo grande del puente
             
+        # NOTA: NO sobreescribimos el status de StructuralHealth aquí.
+        
         if last_update_global:
             bridge_obj["lastUpdate"] = last_update_global.isoformat()
         
@@ -416,7 +424,7 @@ def get_trend_summary(resource_id: str, db: Session = Depends(get_db)):
     # ---------------------------------------------------------
     # El ID viene como "br-puentela-structuralHealth". Hay que separarlo.
     # Definimos los tipos conocidos para detectar cuál es.
-    known_kpi_types = ["structuralHealth", "accelGlob", "accelZ", "accelX", "accelY", "aiAnalysis", "naturalFreq"]
+    known_kpi_types = ["structuralHealth", "accelGlob", "accelX", "accelY", "aiAnalysis", "naturalFreq"]
     
     target_bridge_id = None
     target_type = None
